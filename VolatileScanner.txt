@@ -1,0 +1,608 @@
+Attribute VB_Name = "VolatileScanner"
+Option Explicit
+
+'============================================================
+' 揮発性関数・VLOOKUP スキャナー
+'   対象 : 実行時にアクティブなブック（読み取りのみ・変更しません）
+'   出力 : 新規ブックにレポートを作成
+'   検出 : セルの数式 / 名前定義 / 条件付き書式 / VBAのApplication.Volatile
+'          + VLOOKUP（INDEX/MATCH・XLOOKUP への置換候補、MATCH共有、二分探索）
+'   実行 : ScanVolatileFunctions
+'============================================================
+
+Private Const VOLATILE_LIST As String = "NOW,TODAY,RAND,RANDBETWEEN,RANDARRAY,OFFSET,INDIRECT,CELL,INFO"
+Private Const LOOKUP_LIST As String = "VLOOKUP"
+Private Const MAX_ADDR_LEN As Long = 200
+Private Const MAX_LINKS As Long = 2000
+Private Const MY_MODULE As String = "VolatileScanner"
+
+' 数式パターン（R1C1が同じ＝同じ式をコピーしたもの）ごとの集計
+Private gKeys As Object
+Private gSheet() As String
+Private gFirst() As String
+Private gCount() As Long
+Private gFormula() As String
+Private gFuncs() As String
+Private gAddrs() As String
+Private gAdvice() As String
+Private gSig() As String      ' VLOOKUPの「シート+検索値+検索表+一致方法」
+Private gN As Long
+
+Private funcs() As String
+Private funcTotal As Object
+
+'------------------------------------------------------------
+' メイン
+'------------------------------------------------------------
+Public Sub ScanVolatileFunctions()
+    Dim wb As Workbook, ws As Worksheet
+    Dim rngF As Range, ar As Range
+    Dim v As Variant, r As Long, c As Long
+    Dim others As New Collection
+    Dim t As Single
+    Dim calcMode As Long, hadCalc As Boolean
+
+    Set wb = ActiveWorkbook
+    If wb Is Nothing Then
+        MsgBox "調査するブックをアクティブにしてから実行してください。", vbExclamation
+        Exit Sub
+    End If
+    If MsgBox("「" & wb.Name & "」の揮発性関数とVLOOKUPを調査します。" & vbLf & _
+              "（ブックは変更しません。結果は新しいブックに出力します）", _
+              vbOKCancel + vbQuestion) <> vbOK Then Exit Sub
+
+    funcs = Split(VOLATILE_LIST & "," & LOOKUP_LIST, ",")
+    Set gKeys = CreateObject("Scripting.Dictionary")
+    Set funcTotal = CreateObject("Scripting.Dictionary")
+    gN = 0
+    ReDim gSheet(1 To 500): ReDim gFirst(1 To 500): ReDim gCount(1 To 500)
+    ReDim gFormula(1 To 500): ReDim gFuncs(1 To 500): ReDim gAddrs(1 To 500)
+    ReDim gAdvice(1 To 500): ReDim gSig(1 To 500)
+
+    t = Timer
+    On Error GoTo CleanUp
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    ' レポート書き込みで重いブックが再計算されないよう一時的に手動計算へ
+    calcMode = Application.Calculation: hadCalc = True
+    Application.Calculation = xlCalculationManual
+
+    For Each ws In wb.Worksheets
+        Application.StatusBar = "調査中: " & ws.Name
+        DoEvents
+
+        Set rngF = Nothing
+        On Error Resume Next
+        Set rngF = ws.UsedRange.SpecialCells(xlCellTypeFormulas)
+        On Error GoTo CleanUp
+        ' 保護シート等でSpecialCellsが使えない場合は使用範囲全体を読む
+        If rngF Is Nothing And ws.ProtectContents Then Set rngF = ws.UsedRange
+
+        If Not rngF Is Nothing Then
+            For Each ar In rngF.Areas
+                If ar.CountLarge = 1 Then
+                    ProcessCell ws, ar.Row, ar.Column, CStr(ar.FormulaR1C1)
+                Else
+                    v = ar.FormulaR1C1
+                    For r = 1 To UBound(v, 1)
+                        For c = 1 To UBound(v, 2)
+                            ProcessCell ws, ar.Row + r - 1, ar.Column + c - 1, CStr(v(r, c))
+                        Next c
+                    Next r
+                End If
+            Next ar
+        End If
+
+        ScanCF ws, others
+    Next ws
+
+    Application.StatusBar = "名前定義・VBAを調査中..."
+    ScanNames wb, others
+    ScanVBA wb, others
+
+    Application.StatusBar = "レポート作成中..."
+    WriteReport wb, others, Timer - t
+
+CleanUp:
+    If Err.Number <> 0 Then MsgBox "エラー: " & Err.Description, vbCritical
+    If hadCalc Then Application.Calculation = calcMode
+    Application.StatusBar = False
+    Application.EnableEvents = True
+    Application.ScreenUpdating = True
+End Sub
+
+'------------------------------------------------------------
+' セル1つを判定してパターン別に集計
+'------------------------------------------------------------
+Private Sub ProcessCell(ws As Worksheet, ByVal rw As Long, ByVal cl As Long, ByVal f As String)
+    Dim found As String, key As String, addr As String
+    Dim i As Long, j As Long, parts() As String
+
+    If Left$(f, 1) <> "=" Then Exit Sub
+    found = DetectFuncs(f)
+    If found = "" Then Exit Sub
+
+    addr = ws.Cells(rw, cl).Address(False, False)
+    key = ws.Name & vbTab & f
+
+    If gKeys.Exists(key) Then
+        i = gKeys(key)
+        gCount(i) = gCount(i) + 1
+        If Len(gAddrs(i)) < MAX_ADDR_LEN Then
+            gAddrs(i) = gAddrs(i) & ", " & addr
+            If Len(gAddrs(i)) >= MAX_ADDR_LEN Then gAddrs(i) = gAddrs(i) & " …"
+        End If
+    Else
+        gN = gN + 1
+        If gN > UBound(gSheet) Then GrowArrays
+        i = gN
+        gKeys.Add key, i
+        gSheet(i) = ws.Name
+        gFirst(i) = addr
+        gCount(i) = 1
+        gFormula(i) = ws.Cells(rw, cl).Formula
+        gFuncs(i) = found
+        gAddrs(i) = addr
+        gAdvice(i) = Suggest(found, gFormula(i), ws)   ' パターンごとに1回だけ解析
+        If HasTok(found, "VLOOKUP") Then gSig(i) = VlookupSig(ws, f)
+    End If
+
+    parts = Split(found, ", ")
+    For j = 0 To UBound(parts)
+        funcTotal(parts(j)) = funcTotal(parts(j)) + 1
+    Next j
+End Sub
+
+Private Sub GrowArrays()
+    Dim n As Long: n = UBound(gSheet) * 2
+    ReDim Preserve gSheet(1 To n): ReDim Preserve gFirst(1 To n)
+    ReDim Preserve gCount(1 To n): ReDim Preserve gFormula(1 To n)
+    ReDim Preserve gFuncs(1 To n): ReDim Preserve gAddrs(1 To n)
+    ReDim Preserve gAdvice(1 To n): ReDim Preserve gSig(1 To n)
+End Sub
+
+'------------------------------------------------------------
+' 数式の解析ユーティリティ
+'------------------------------------------------------------
+' 対象関数を検出（"文字列" や 'シート名' 内は無視）
+Private Function DetectFuncs(ByVal f As String) As String
+    Dim u As String, s As String, res As String
+    Dim i As Long, hit As Boolean
+
+    u = UCase$(f)
+    For i = 0 To UBound(funcs)          ' 高速な事前チェック
+        If InStr(1, u, funcs(i) & "(", vbBinaryCompare) > 0 Then hit = True: Exit For
+    Next i
+    If Not hit Then Exit Function
+
+    s = Replace(MaskQuoted(u), "_XLFN.", "")
+    For i = 0 To UBound(funcs)
+        If FindFunc(s, funcs(i), 1) > 0 Then res = res & IIf(Len(res) > 0, ", ", "") & funcs(i)
+    Next i
+    DetectFuncs = res
+End Function
+
+' 関数名の位置を返す（見つからなければ0）。sは大文字・マスク済みの数式
+Private Function FindFunc(ByVal s As String, ByVal fn As String, ByVal startPos As Long) As Long
+    Dim p As Long
+    p = InStr(startPos, s, fn & "(", vbBinaryCompare)
+    Do While p > 0
+        If p = 1 Then FindFunc = p: Exit Function
+        If Not (Mid$(s, p - 1, 1) Like "[A-Z0-9_.]") Then FindFunc = p: Exit Function
+        p = InStr(p + 1, s, fn & "(", vbBinaryCompare)
+    Loop
+End Function
+
+Private Function CountFunc(ByVal s As String, ByVal fn As String) As Long
+    Dim p As Long
+    p = FindFunc(s, fn, 1)
+    Do While p > 0
+        CountFunc = CountFunc + 1
+        p = FindFunc(s, fn, p + 1)
+    Loop
+End Function
+
+' 引用符内（文字列・シート名）を空白に置き換える。文字位置は変えない
+Private Function MaskQuoted(ByVal f As String) As String
+    Dim i As Long, ch As String, q As String
+    For i = 1 To Len(f)
+        ch = Mid$(f, i, 1)
+        If q = "" Then
+            If ch = """" Or ch = "'" Then q = ch: Mid$(f, i, 1) = " "
+        Else
+            If ch = q Then q = ""
+            Mid$(f, i, 1) = " "
+        End If
+    Next i
+    MaskQuoted = f
+End Function
+
+' 関数の引数を分解。openPos = "(" の位置、closePos に ")" の位置を返す
+Private Function ParseArgs(ByVal f As String, ByVal m As String, ByVal openPos As Long, _
+                           ByRef closePos As Long) As Collection
+    Dim col As New Collection, i As Long, depth As Long, st As Long, ch As String
+    st = openPos + 1
+    For i = openPos + 1 To Len(m)
+        ch = Mid$(m, i, 1)
+        Select Case ch
+            Case "(", "{"
+                depth = depth + 1
+            Case ")", "}"
+                If depth = 0 Then
+                    col.Add Mid$(f, st, i - st)
+                    closePos = i
+                    Set ParseArgs = col
+                    Exit Function
+                End If
+                depth = depth - 1
+            Case ","
+                If depth = 0 Then col.Add Mid$(f, st, i - st): st = i + 1
+        End Select
+    Next i
+    closePos = Len(f)
+    Set ParseArgs = col
+End Function
+
+Private Function HasTok(ByVal found As String, ByVal tok As String) As Boolean
+    HasTok = InStr(1, "," & Replace(found, " ", "") & ",", "," & tok & ",", vbBinaryCompare) > 0
+End Function
+
+' 参照文字列をRangeに解決（できなければNothing）
+Private Function ResolveRange(ByVal ref As String, ws As Worksheet) As Range
+    Dim p As Long, shName As String, addr As String, rg As Range
+    If ws Is Nothing Then Exit Function
+    If InStr(ref, "[") > 0 Then Exit Function     ' 外部参照・構造化参照は対象外
+    On Error Resume Next
+    p = InStrRev(ref, "!")
+    If p > 0 Then
+        shName = Left$(ref, p - 1): addr = Mid$(ref, p + 1)
+        If Left$(shName, 1) = "'" Then shName = Replace(Mid$(shName, 2, Len(shName) - 2), "''", "'")
+        Set rg = ws.Parent.Worksheets(shName).Range(addr)
+    Else
+        Set rg = ws.Range(ref)
+        If rg Is Nothing Then Set rg = ws.Parent.Names(ref).RefersToRange
+    End If
+    On Error GoTo 0
+    Set ResolveRange = rg
+End Function
+
+'------------------------------------------------------------
+' 置換候補
+'------------------------------------------------------------
+Private Function Suggest(ByVal found As String, ByVal f As String, ws As Worksheet) As String
+    Dim s As String
+
+    If HasTok(found, "OFFSET") Then
+        s = s & "【OFFSET】INDEXに置換（INDEXは非揮発）。" & _
+            "例: SUM(OFFSET(A1,0,0,n,1)) → SUM(A1:INDEX(A:A,n))、" & _
+            "OFFSET(基点,r,c) → INDEX(範囲,r+1,c+1)。可変範囲ならテーブル化（構造化参照）も有効。" & vbLf
+    End If
+    If HasTok(found, "INDIRECT") Then
+        If InStr(f, "&") > 0 Then
+            s = s & "【INDIRECT】文字列を結合して参照先を作っています。" & _
+                "シート切替なら CHOOSE(番号,Sheet1!A1,Sheet2!A1,…)、" & _
+                "または各シートのデータを1つの表にまとめて SUMIFS / XLOOKUP / INDEX+MATCH で引く形へ。" & vbLf
+        Else
+            s = s & "【INDIRECT】固定文字列の参照なら直接参照に（例: =INDIRECT(""A1"") → =A1）。" & _
+                "行削除でずれない参照が目的なら INDEX(A:A,1) で代替。" & vbLf
+        End If
+    End If
+    If HasTok(found, "TODAY") Or HasTok(found, "NOW") Then
+        s = s & "【TODAY/NOW】基準日（日時）を1セル（例: 設定!B1）に値で入力し、全ての式はそのセルを参照。" & _
+            "更新は Ctrl+;（日付）/ Ctrl+:（時刻）や更新用マクロで。" & vbLf
+    End If
+    If HasTok(found, "RAND") Or HasTok(found, "RANDBETWEEN") Or HasTok(found, "RANDARRAY") Then
+        s = s & "【RAND系】結果を固定してよければ値貼り付け。再生成が必要な場合だけマクロで値を書き込む。" & vbLf
+    End If
+    If HasTok(found, "CELL") Then
+        s = s & "【CELL】CELL(""filename"") 等でシート名・パスを取得しているなら文字列で固定するか、マクロで値を書き込む。" & vbLf
+    End If
+    If HasTok(found, "INFO") Then
+        s = s & "【INFO】値で固定する。" & vbLf
+    End If
+    If HasTok(found, "VLOOKUP") Then
+        s = s & VlookupAdvice(f, ws) & vbLf
+    End If
+
+    Do While Right$(s, 1) = vbLf
+        s = Left$(s, Len(s) - 1)
+    Loop
+    Suggest = s
+End Function
+
+' VLOOKUP の置換候補（数式の最初のVLOOKUPを解析）
+Private Function VlookupAdvice(ByVal f As String, ws As Worksheet) As String
+    Dim m As String, p As Long, cp As Long, q As Long, args As Collection
+    Dim lv As String, tbl As String, ci As String, mt As String
+    Dim exact As Boolean, omitted As Boolean
+    Dim rg As Range, prefix As String, firstCol As String, retCol As String
+    Dim s As String, newF As String, nV As Long
+
+    m = MaskQuoted(UCase$(f))
+    p = FindFunc(m, "VLOOKUP", 1)
+    If p = 0 Then Exit Function
+    Set args = ParseArgs(f, m, p + Len("VLOOKUP"), cp)
+    If args.Count < 3 Then Exit Function
+
+    lv = Trim$(args(1)): tbl = Trim$(args(2)): ci = Trim$(args(3))
+    If args.Count >= 4 Then
+        mt = UCase$(Trim$(args(4)))
+        exact = (mt = "FALSE" Or mt = "0" Or mt = "")
+    Else
+        omitted = True
+    End If
+    nV = CountFunc(m, "VLOOKUP")
+
+    ' 検索表を解決できれば先頭列・取得列の具体的なアドレスを作る
+    Set rg = ResolveRange(tbl, ws)
+    If Not rg Is Nothing Then
+        q = InStrRev(tbl, "!")
+        If q > 0 Then prefix = Left$(tbl, q)
+        firstCol = prefix & rg.Columns(1).Address
+        If IsNumeric(ci) Then
+            If CLng(ci) >= 1 And CLng(ci) <= rg.Columns.Count Then
+                retCol = prefix & rg.Columns(CLng(ci)).Address
+            End If
+        End If
+    End If
+    If firstCol = "" Then firstCol = "INDEX(" & tbl & ",0,1)"
+
+    If retCol <> "" Then
+        newF = "INDEX(" & retCol & ",MATCH(" & lv & "," & firstCol & "," & IIf(exact, "0", "1") & "))"
+    Else
+        newF = "INDEX(" & tbl & ",MATCH(" & lv & "," & firstCol & "," & IIf(exact, "0", "1") & ")," & ci & ")"
+    End If
+
+    s = "【VLOOKUP→INDEX/MATCH】" & Mid$(f, p, cp - p + 1) & " → " & newF
+    If retCol <> "" Then
+        s = s & "（365/2021なら XLOOKUP(" & lv & "," & firstCol & "," & retCol & IIf(exact, "", ",,-1") & ")）"
+    End If
+    s = s & "。単純な置換だけでは速度差は小さめで、効果が大きいのは下の『MATCHの共有』『二分探索』です。"
+
+    If exact Then
+        s = s & vbLf & "【二分探索】完全一致は先頭から順に探すため、行数×セル数で重くなります。" & _
+            "検索表を先頭列で昇順に並べ替えられるなら二分探索に: "
+        If retCol <> "" Then
+            s = s & "XLOOKUP(" & lv & "," & firstCol & "," & retCol & ",,0,2) または " & _
+                "IF(INDEX(" & firstCol & ",MATCH(" & lv & "," & firstCol & ",1))=" & lv & _
+                ",INDEX(" & retCol & ",MATCH(" & lv & "," & firstCol & ",1)),NA())"
+        Else
+            s = s & "XLOOKUP(検索値,先頭列,取得列,,0,2) または " & _
+                "IF(INDEX(先頭列,MATCH(検索値,先頭列,1))=検索値,INDEX(取得列,MATCH(検索値,先頭列,1)),NA())"
+        End If
+    ElseIf omitted Then
+        s = s & vbLf & "【注意】第4引数が省略＝近似一致です（高速）。検索表が昇順でないと誤った値を返すので、意図どおりか確認。"
+    End If
+
+    If nV > 1 Then
+        s = s & vbLf & "【重複検索】1つの式にVLOOKUPが " & nV & " 個あります（IFERROR(VLOOKUP(…),VLOOKUP(…)) 等）。" & _
+            "検索結果を補助列に置いて再利用できないか検討。"
+    End If
+    VlookupAdvice = s
+End Function
+
+' 「同じ検索値・同じ検索表で列番号だけ違う」VLOOKUPをまとめるためのキー（R1C1で作成）
+Private Function VlookupSig(ws As Worksheet, ByVal fR1C1 As String) As String
+    Dim m As String, p As Long, cp As Long, args As Collection, mt As String
+    m = MaskQuoted(UCase$(fR1C1))
+    p = FindFunc(m, "VLOOKUP", 1)
+    If p = 0 Then Exit Function
+    Set args = ParseArgs(fR1C1, m, p + Len("VLOOKUP"), cp)
+    If args.Count < 3 Then Exit Function
+    If args.Count >= 4 Then mt = UCase$(Trim$(args(4))) Else mt = "TRUE"
+    If mt = "" Or mt = "0" Then mt = "FALSE"
+    VlookupSig = ws.Name & vbTab & UCase$(Trim$(args(1))) & vbTab & UCase$(Trim$(args(2))) & vbTab & mt
+End Function
+
+'------------------------------------------------------------
+' 名前定義
+'------------------------------------------------------------
+Private Sub ScanNames(wb As Workbook, others As Collection)
+    Dim nm As Name, ref As String, found As String, scope As String
+    For Each nm In wb.Names
+        ref = "": scope = "ブック"
+        On Error Resume Next
+        ref = nm.RefersTo
+        If TypeOf nm.Parent Is Worksheet Then scope = nm.Parent.Name
+        On Error GoTo 0
+        If Len(ref) > 0 Then
+            found = DetectFuncs(ref)
+            If found <> "" Then
+                others.Add Array("名前定義", scope, nm.Name, "", found, ref, _
+                    IIf(nm.Visible, "", "（非表示の名前）"), _
+                    Suggest(found, ref, Nothing) & vbLf & "※この名前を使う全てのセルに影響します")
+            End If
+        End If
+    Next nm
+End Sub
+
+'------------------------------------------------------------
+' 条件付き書式
+'------------------------------------------------------------
+Private Sub ScanCF(ws As Worksheet, others As Collection)
+    Dim i As Long, n As Long, fc As Object
+    Dim f As String, ap As String, found As String
+
+    On Error Resume Next
+    n = ws.Cells.FormatConditions.Count
+    For i = 1 To n
+        Set fc = Nothing: f = "": ap = ""
+        Set fc = ws.Cells.FormatConditions(i)
+        If Not fc Is Nothing Then
+            f = fc.Formula1
+            ap = fc.AppliesTo.Address(False, False)
+            If Len(f) > 0 Then
+                found = DetectFuncs(f)
+                If found <> "" Then
+                    others.Add Array("条件付き書式", ws.Name, ap, "", found, f, "", _
+                        Suggest(found, f, ws) & vbLf & "※条件付き書式は画面表示のたびに評価されます")
+                End If
+            End If
+        End If
+    Next i
+    On Error GoTo 0
+End Sub
+
+'------------------------------------------------------------
+' VBAユーザー定義関数の Application.Volatile
+'------------------------------------------------------------
+Private Sub ScanVBA(wb As Workbook, others As Collection)
+    Dim comp As Object, cm As Object
+    Dim ln As Long, txt As String, proc As String, n As Long
+
+    On Error Resume Next
+    n = wb.VBProject.VBComponents.Count
+    If Err.Number <> 0 Then
+        Err.Clear
+        On Error GoTo 0
+        others.Add Array("VBA", "", "", "", "（確認不可）", "", "VBAプロジェクトにアクセスできません", _
+            "UDF内の Application.Volatile も調べる場合は、トラストセンター →［マクロの設定］→" & _
+            "『VBA プロジェクト オブジェクト モデルへのアクセスを信頼する』をオンにして再実行")
+        Exit Sub
+    End If
+    On Error GoTo 0
+
+    For Each comp In wb.VBProject.VBComponents
+        If comp.Name <> MY_MODULE Then
+            Set cm = comp.CodeModule
+            For ln = 1 To cm.CountOfLines
+                txt = Trim$(cm.Lines(ln, 1))
+                If Left$(txt, 1) <> "'" Then
+                    If InStr(1, txt, "Application.Volatile", vbTextCompare) > 0 And _
+                       InStr(1, txt, "False", vbTextCompare) = 0 Then
+                        proc = ""
+                        On Error Resume Next
+                        proc = cm.ProcOfLine(ln, 0)
+                        On Error GoTo 0
+                        others.Add Array("VBA(UDF)", comp.Name, "行 " & ln, "", "Application.Volatile", txt, _
+                            "関数: " & proc, _
+                            "Application.Volatile を削除し、計算に使うセルは全て引数で渡す（引数のセルが変わった時だけ再計算されます）")
+                    End If
+                End If
+            Next ln
+        End If
+    Next comp
+End Sub
+
+'------------------------------------------------------------
+' レポート出力
+'------------------------------------------------------------
+Private Sub WriteReport(src As Workbook, others As Collection, ByVal elapsed As Single)
+    Dim rb As Workbook, sh As Worksheet
+    Dim out() As Variant, i As Long, k As Long, r As Long
+    Dim hdrRow As Long, firstRow As Long, lastRow As Long
+    Dim volCells As Long, vlkCells As Long, summary As String, key As Variant
+    Dim links As Long, arr As Variant
+    Dim sigPat As Object, sigCells As Object
+    Dim isVol As Boolean, isVlk As Boolean, adv As String
+
+    ' 同じ検索値・検索表のVLOOKUPパターン数を集計
+    Set sigPat = CreateObject("Scripting.Dictionary")
+    Set sigCells = CreateObject("Scripting.Dictionary")
+    For i = 1 To gN
+        If gSig(i) <> "" Then
+            sigPat(gSig(i)) = sigPat(gSig(i)) + 1
+            sigCells(gSig(i)) = sigCells(gSig(i)) + gCount(i)
+        End If
+    Next i
+
+    Set rb = Workbooks.Add(xlWBATWorksheet)
+    Set sh = rb.Worksheets(1)
+    sh.Name = "揮発性関数・VLOOKUP"
+
+    For i = 1 To gN
+        If Replace(Replace(gFuncs(i), "VLOOKUP", ""), ", ", "") <> "" Then volCells = volCells + gCount(i)
+        If HasTok(gFuncs(i), "VLOOKUP") Then vlkCells = vlkCells + gCount(i)
+    Next i
+    For Each key In funcTotal.Keys
+        summary = summary & key & "=" & Format(funcTotal(key), "#,##0") & "  "
+    Next key
+
+    sh.Range("A1").Value = "揮発性関数・VLOOKUP レポート： " & src.Name
+    sh.Range("A2").Value = "実行: " & Format(Now, "yyyy/mm/dd hh:nn") & "   所要 " & Format(elapsed, "0.0") & " 秒"
+    sh.Range("A3").Value = "揮発性セル: " & Format(volCells, "#,##0") & "   VLOOKUPセル: " & Format(vlkCells, "#,##0") & _
+                           "（数式パターン " & Format(gN, "#,##0") & " 種類）   関数別: " & IIf(summary = "", "なし", summary)
+    sh.Range("A1").Font.Bold = True: sh.Range("A1").Font.Size = 14
+
+    hdrRow = 5
+    sh.Range("A5:H5").Value = Array("種別", "シート", "先頭セル／名前", "セル数", "検出関数", _
+                                    "数式（例）", "対象セル（一部）／備考", "置換候補")
+    firstRow = hdrRow + 1
+
+    ' --- セル（パターン別、セル数の多い順） ---
+    If gN > 0 Then
+        ReDim out(1 To gN, 1 To 8)
+        For i = 1 To gN
+            isVlk = HasTok(gFuncs(i), "VLOOKUP")
+            isVol = (Replace(Replace(gFuncs(i), "VLOOKUP", ""), ", ", "") <> "")
+            adv = gAdvice(i)
+            If gSig(i) <> "" Then
+                If sigPat(gSig(i)) >= 2 Then
+                    adv = "【最優先：MATCHの共有】同じ検索値・検索表で列番号だけ違うVLOOKUPが " & sigPat(gSig(i)) & _
+                          " パターン（計 " & Format(sigCells(gSig(i)), "#,##0") & " セル）あります。" & _
+                          "補助列に =MATCH(検索値,先頭列,0) を1回だけ置き、各列は =INDEX(取得列,補助列のセル) で取得すると" & _
+                          "検索回数が約 1/" & sigPat(gSig(i)) & " になります。" & vbLf & adv
+                End If
+            End If
+            out(i, 1) = "セル（" & IIf(isVol And isVlk, "揮発性+VLOOKUP", IIf(isVol, "揮発性", "VLOOKUP")) & "）"
+            out(i, 2) = gSheet(i)
+            out(i, 3) = gFirst(i)
+            out(i, 4) = gCount(i)
+            out(i, 5) = gFuncs(i)
+            out(i, 6) = "'" & gFormula(i)
+            out(i, 7) = gAddrs(i)
+            out(i, 8) = adv
+        Next i
+        sh.Cells(firstRow, 1).Resize(gN, 8).Value = out
+        sh.Cells(firstRow, 1).Resize(gN, 8).Sort _
+            Key1:=sh.Cells(firstRow, 4), Order1:=xlDescending, Header:=xlNo
+
+        ' 元ブックの該当セルへのリンク（保存済みブックのみ）
+        If src.Path <> "" Then
+            For r = firstRow To firstRow + gN - 1
+                If links >= MAX_LINKS Then Exit For
+                sh.Hyperlinks.Add Anchor:=sh.Cells(r, 3), Address:=src.FullName, _
+                    SubAddress:="'" & Replace(sh.Cells(r, 2).Value, "'", "''") & "'!" & sh.Cells(r, 3).Value
+                links = links + 1
+            Next r
+        End If
+    End If
+
+    ' --- 名前定義・条件付き書式・VBA ---
+    r = firstRow + gN
+    For k = 1 To others.Count
+        arr = others(k)
+        If Left$(arr(5), 1) = "=" Then arr(5) = "'" & arr(5)
+        sh.Cells(r, 1).Resize(1, 8).Value = arr
+        r = r + 1
+    Next k
+    lastRow = r - 1
+
+    If lastRow < firstRow Then
+        sh.Cells(firstRow, 1).Value = "揮発性関数・VLOOKUPは見つかりませんでした。"
+        lastRow = firstRow
+    End If
+
+    ' --- 書式 ---
+    With sh.Range(sh.Cells(hdrRow, 1), sh.Cells(hdrRow, 8))
+        .Font.Bold = True
+        .Interior.Color = RGB(221, 235, 247)
+    End With
+    sh.Columns("A").ColumnWidth = 18
+    sh.Columns("B").ColumnWidth = 16
+    sh.Columns("C").ColumnWidth = 16
+    sh.Columns("D").ColumnWidth = 8
+    sh.Columns("E").ColumnWidth = 16
+    sh.Columns("F").ColumnWidth = 50
+    sh.Columns("G").ColumnWidth = 30
+    sh.Columns("H").ColumnWidth = 80
+    sh.Columns("D").NumberFormat = "#,##0"
+    With sh.Range(sh.Cells(firstRow, 1), sh.Cells(lastRow, 8))
+        .WrapText = True
+        .VerticalAlignment = xlTop
+    End With
+    sh.Range(sh.Cells(hdrRow, 1), sh.Cells(lastRow, 8)).AutoFilter
+    sh.Activate
+    sh.Cells(firstRow, 1).Select
+    ActiveWindow.FreezePanes = True
+End Sub
